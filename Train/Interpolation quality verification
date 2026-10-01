@@ -1,0 +1,266 @@
+# -*- coding: utf-8 -*-
+"""
+插补前后皮尔逊相关矩阵热力图对比（增强版）
+新增：缺失率统计、描述性统计对比、分布变化可视化
+由于Predict.py中绘制的插补质量前后对比图不够清晰，无法在论文中使用
+使用这个程序，以及Predict.py输出的训练集数据科研绘制出论文中相同的对比图
+"""
+
+import os
+import sys
+import matplotlib
+
+try:
+    matplotlib.use('TkAgg')
+except ImportError:
+    matplotlib.use('Agg')
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns  # 用于分布图
+
+# ===================== 用户配置 =====================
+BEFORE_PATH = r"D:\心理\生活满意度预测\01处理数据\训练数据\个体文化主义国家.xlsx"
+AFTER_PATH = r"D:\心理\生活满意度预测\01处理数据\训练数据\结果\个体\imputed_data.csv"
+OUTPUT_DIR = r"D:\心理\生活满意度预测\01处理数据\训练数据\结果\个体"
+SAVE_NAME = "correlation_comparison6.png"
+# 分布对比图显示的特征数量（按列顺序取前N个）
+N_DIST_FEATURES = 6
+
+
+# ===================================================
+
+def compute_missing_rate(df):
+    """计算DataFrame每列的缺失率（0~1）"""
+    missing = df.isnull().sum()
+    total = len(df)
+    return missing / total
+
+
+def read_and_align(before_path, after_path):
+    """读取数据，只保留数值型共同列，同时返回缺失率"""
+    df_before = pd.read_excel(before_path, engine='openpyxl')
+    df_after = pd.read_csv(after_path)
+
+    common_cols = list(set(df_before.columns) & set(df_after.columns))
+    if not common_cols:
+        raise ValueError("两个数据集没有共同列！")
+
+    df_before = df_before[common_cols]
+    df_after = df_after[common_cols]
+
+    # 仅保留数值列
+    num_cols_before = df_before.select_dtypes(include=[np.number]).columns.tolist()
+    num_cols_after = df_after.select_dtypes(include=[np.number]).columns.tolist()
+    num_cols = list(set(num_cols_before) & set(num_cols_after))
+    if not num_cols:
+        raise ValueError("没有共同的数值型列！")
+
+    print(f"用于分析的数值特征数：{len(num_cols)}")
+
+    missing_before = compute_missing_rate(df_before[num_cols])
+    missing_after = compute_missing_rate(df_after[num_cols])
+
+    return df_before[num_cols], df_after[num_cols], num_cols, missing_before, missing_after
+
+
+def validate_imputation_quality(df_before, df_after, num_cols, output_dir):
+    """
+    插补质量验证：
+    1. 描述性统计对比
+    2. 均值变化检测
+    3. 分布对比图（前N个特征）
+    """
+    # ---- 描述性统计 ----
+    stats_before = df_before.describe(percentiles=[0.25, 0.5, 0.75]).T
+    stats_after = df_after.describe(percentiles=[0.25, 0.5, 0.75]).T
+
+    # 合并为对比表格（只保留共同统计量）
+    common_stats = ['mean', 'std', 'min', '25%', '50%', '75%', 'max']
+    compare_df = pd.DataFrame(index=num_cols)
+    for stat in common_stats:
+        compare_df[f'before_{stat}'] = stats_before[stat]
+        compare_df[f'after_{stat}'] = stats_after[stat]
+        # 计算变化量（绝对值）
+        compare_df[f'diff_{stat}'] = stats_after[stat] - stats_before[stat]
+        # 变化百分比（均值、中位数等）
+        if stat in ['mean', '50%']:
+            base = stats_before[stat].replace(0, np.nan)  # 避免除以0
+            compare_df[f'pct_change_{stat}'] = (stats_after[stat] - stats_before[stat]) / base * 100
+
+    # 保存详细统计
+    stats_path = os.path.join(output_dir, "descriptive_stats.csv")
+    compare_df.to_csv(stats_path, encoding='utf-8-sig')
+    print(f"描述性统计对比已保存至：{stats_path}")
+
+    # ---- 均值变化检测（超过5%则警告） ----
+    threshold = 5.0  # 百分比
+    if 'pct_change_mean' in compare_df.columns:
+        large_changes = compare_df[abs(compare_df['pct_change_mean']) > threshold]
+        if not large_changes.empty:
+            print("\n⚠️ 以下特征均值变化超过 5%：")
+            for idx, row in large_changes.iterrows():
+                print(
+                    f"  {idx}: 变化 {row['pct_change_mean']:.2f}% (before={row['before_mean']:.3f}, after={row['after_mean']:.3f})")
+        else:
+            print("\n✅ 所有特征均值变化均在 5% 以内。")
+
+    # ---- 分布对比图（前N个特征） ----
+    n_plot = min(N_DIST_FEATURES, len(num_cols))
+    if n_plot > 0:
+        fig, axes = plt.subplots(1, n_plot, figsize=(4 * n_plot, 3), sharey=False)
+        if n_plot == 1:
+            axes = [axes]
+        for i, col in enumerate(num_cols[:n_plot]):
+            # 剔除缺失值后绘制密度
+            before_vals = df_before[col].dropna()
+            after_vals = df_after[col].dropna()
+            if len(before_vals) > 1 and len(after_vals) > 1:
+                sns.kdeplot(before_vals, ax=axes[i], label='Before', fill=True, color='blue', alpha=0.5)
+                sns.kdeplot(after_vals, ax=axes[i], label='After', fill=True, color='orange', alpha=0.5)
+                axes[i].set_title(col, fontsize=10)
+                axes[i].legend(fontsize=8)
+            else:
+                axes[i].text(0.5, 0.5, 'Insufficient data', ha='center', va='center', transform=axes[i].transAxes)
+                axes[i].set_title(col)
+        plt.tight_layout()
+        dist_path = os.path.join(output_dir, "distribution_comparison.png")
+        plt.savefig(dist_path, dpi=200, bbox_inches='tight')
+        print(f"分布对比图已保存至：{dist_path}")
+        plt.close(fig)
+
+
+def plot_correlation_comparison(df_before, df_after, num_cols, save_path=None):
+    """绘制左右对比热力图，共享colorbar，带网格线"""
+    n_feats = len(num_cols)
+
+    corr_before = df_before.corr()
+    corr_after = df_after.corr()
+
+    width = max(16, 8 + n_feats / 12)
+    height = width * 0.55
+    fig, axes = plt.subplots(1, 2, figsize=(width, height))
+    fig.suptitle('Correlation Matrix Comparison Before and After Imputation',
+                 fontsize=16, fontweight='bold', y=0.98)
+
+    if n_feats <= 30:
+        label_fontsize = 8;
+        value_fontsize = 7
+    elif n_feats <= 50:
+        label_fontsize = 6;
+        value_fontsize = 5
+    elif n_feats <= 80:
+        label_fontsize = 5;
+        value_fontsize = 3
+    else:
+        label_fontsize = 4;
+        value_fontsize = 0
+
+    # 左图
+    im1 = axes[0].imshow(corr_before, cmap='RdYlBu_r', vmin=-1, vmax=1, interpolation='none')
+    axes[0].set_title('Before Imputation', fontsize=14, fontweight='bold')
+    axes[0].set_xticks(range(n_feats));
+    axes[0].set_yticks(range(n_feats))
+    axes[0].set_xticklabels(num_cols, rotation=90, fontsize=label_fontsize)
+    axes[0].set_yticklabels(num_cols, fontsize=label_fontsize)
+    if value_fontsize > 0:
+        for i in range(n_feats):
+            for j in range(n_feats):
+                val = corr_before.iloc[i, j]
+                if np.isnan(val): continue
+                color = 'white' if abs(val) > 0.5 else 'black'
+                axes[0].text(j, i, f'{val:.2f}', ha='center', va='center',
+                             fontsize=value_fontsize, color=color)
+
+    # 右图
+    im2 = axes[1].imshow(corr_after, cmap='RdYlBu_r', vmin=-1, vmax=1, interpolation='none')
+    axes[1].set_title('After Imputation', fontsize=14, fontweight='bold')
+    axes[1].set_xticks(range(n_feats));
+    axes[1].set_yticks(range(n_feats))
+    axes[1].set_xticklabels(num_cols, rotation=90, fontsize=label_fontsize)
+    axes[1].set_yticklabels(num_cols, fontsize=label_fontsize)
+    if value_fontsize > 0:
+        for i in range(n_feats):
+            for j in range(n_feats):
+                val = corr_after.iloc[i, j]
+                if np.isnan(val): continue
+                color = 'white' if abs(val) > 0.5 else 'black'
+                axes[1].text(j, i, f'{val:.2f}', ha='center', va='center',
+                             fontsize=value_fontsize, color=color)
+
+    # 网格线
+    for ax in axes:
+        ax.grid(False)
+        ax.set_xticks(np.arange(n_feats) - 0.5, minor=True)
+        ax.set_yticks(np.arange(n_feats) - 0.5, minor=True)
+        ax.grid(which='minor', color='lightgray', linestyle='-', linewidth=0.6, zorder=10)
+        ax.tick_params(which='both', zorder=20)
+
+    plt.subplots_adjust(left=0.05, right=0.85, top=0.92, bottom=0.08, wspace=0.15)
+    cax = fig.add_axes([0.87, 0.15, 0.02, 0.7])
+    cbar = fig.colorbar(im1, cax=cax, orientation='vertical')
+    cbar.set_label('Pearson Correlation Coefficient', fontsize=12)
+    cbar.ax.tick_params(labelsize=10)
+
+    if save_path:
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        print(f"热力图已保存至：{save_path}")
+    plt.show()
+    plt.close()
+
+
+def main():
+    if not os.path.exists(BEFORE_PATH):
+        print(f"错误：找不到 {BEFORE_PATH}")
+        sys.exit(1)
+    if not os.path.exists(AFTER_PATH):
+        print(f"错误：找不到 {AFTER_PATH}")
+        sys.exit(1)
+
+    if OUTPUT_DIR != "." and not os.path.exists(OUTPUT_DIR):
+        os.makedirs(OUTPUT_DIR)
+
+    try:
+        df_before, df_after, num_cols, miss_before, miss_after = read_and_align(BEFORE_PATH, AFTER_PATH)
+
+        # ---- 缺失率输出 ----
+        print("\n=== 特征缺失率统计 ===")
+        miss_before_gt0 = miss_before[miss_before > 0]
+        miss_after_gt0 = miss_after[miss_after > 0]
+        if len(miss_before_gt0) > 0:
+            print("\n插补前存在缺失的特征：")
+            for col, rate in miss_before_gt0.items():
+                print(f"  {col}: {rate:.2%}")
+        else:
+            print("\n插补前所有特征无缺失。")
+        if len(miss_after_gt0) > 0:
+            print("\n插补后存在缺失的特征：")
+            for col, rate in miss_after_gt0.items():
+                print(f"  {col}: {rate:.2%}")
+        else:
+            print("\n插补后所有特征无缺失。")
+
+        missing_df = pd.DataFrame({
+            '特征': num_cols,
+            '插补前缺失率': miss_before,
+            '插补后缺失率': miss_after
+        })
+        miss_save_path = os.path.join(OUTPUT_DIR, "missing_rates.csv")
+        missing_df.to_csv(miss_save_path, index=False, encoding='utf-8-sig')
+        print(f"\n完整缺失率表格已保存至：{miss_save_path}")
+
+        # ---- 新增：插补质量验证 ----
+        validate_imputation_quality(df_before, df_after, num_cols, OUTPUT_DIR)
+
+        # ---- 相关性热力图 ----
+        save_full_path = os.path.join(OUTPUT_DIR, SAVE_NAME)
+        plot_correlation_comparison(df_before, df_after, num_cols, save_full_path)
+
+    except Exception as e:
+        print(f"运行出错：{e}")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
