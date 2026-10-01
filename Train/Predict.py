@@ -8,7 +8,8 @@ PISA 2018 生活满意度预测 - 增强版（满足所有要求）
 4. SHAP深度分析（Top20特征，5*4排列）
 5. H-statistic特征交互检验
 6. 保留所有原始功能与可视化
-7. 修复：KNN插补后NaN残留导致LinearRegression报错问题
+7. 由于Predict.py中绘制的插补质量前后对比图不够清晰，无法在论文中使用
+使用Interpolation quality verification.py程序，以及Predict.py输出的训练集数据科研绘制出论文中相同的对比图
 """
 import os
 import warnings
