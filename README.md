@@ -78,3 +78,4 @@ python Train/Predict.py
 - 当前脚本中的输入和输出路径示例为 Windows 绝对路径；在 Linux、macOS 或其他 Windows 环境运行时，请先改成当前机器可访问的路径。
 - 预处理脚本会读写较大的 PISA 文件。请预留足够的磁盘空间和内存，并检查 Excel 工作簿及目标列是否符合脚本预期。
 - `Train/Predict.py` 在模块顶层直接执行完整分析流程，因此应在配置好路径后作为脚本运行，而不是直接导入。
+- 由于Predict.py中绘制的插补质量前后对比图不够清晰，无法在论文中使用,要使用Interpolation quality verification.py程序，以及Predict.py输出的训练集数据科研绘制出论文中相同的对比图
