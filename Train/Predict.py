@@ -8,8 +8,7 @@ PISA 2018 生活满意度预测 - 增强版（满足所有要求）
 4. SHAP深度分析（Top20特征，5*4排列）
 5. H-statistic特征交互检验
 6. 保留所有原始功能与可视化
-7. 由于Predict.py中绘制的插补质量前后对比图不够清晰，无法在论文中使用
-使用Interpolation quality verification.py程序，以及Predict.py输出的训练集数据科研绘制出论文中相同的对比图
+7. 插补质量图采用独立验证脚本的论文绘图逻辑：KDE分布叠加与双相关矩阵热力图
 """
 import os
 import warnings
@@ -34,13 +33,18 @@ from scipy.spatial.distance import cdist
 import gower  # Gower距离（混合类型变量）
 import shap  # SHAP分析
 
-# -------------------- 核心修复：字体与特殊字符渲染配置 --------------------
-plt.rcParams['font.sans-serif'] = ['Microsoft YaHei', 'SimHei', 'DejaVu Sans']
+# -------------------- 全局绘图字体与特殊字符渲染配置 --------------------
+plt.rcParams['font.family'] = 'Times New Roman'
+plt.rcParams['font.serif'] = ['Times New Roman']
+plt.rcParams['font.sans-serif'] = ['Times New Roman']
 plt.rcParams['axes.unicode_minus'] = False
-plt.rcParams['font.family'] = 'sans-serif'
-plt.rcParams['mathtext.fontset'] = 'cm'
+plt.rcParams['mathtext.fontset'] = 'stix'
+plt.rcParams['mathtext.rm'] = 'Times New Roman'
+plt.rcParams['mathtext.it'] = 'Times New Roman:italic'
+plt.rcParams['mathtext.bf'] = 'Times New Roman:bold'
 plt.rcParams['figure.subplot.wspace'] = 0.3
 plt.rcParams['figure.subplot.hspace'] = 0.5
+sns.set_theme(style='whitegrid', font='Times New Roman')
 
 # 机器学习库（新增所需模型）
 from sklearn.model_selection import train_test_split
@@ -52,7 +56,7 @@ from sklearn.ensemble import (RandomForestRegressor, StackingRegressor,
 from sklearn.linear_model import LinearRegression, Lasso, LassoCV  # 新增MLR、Lasso
 from sklearn.svm import SVR  # 新增SVR
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-from sklearn.base import BaseEstimator, RegressorMixin
+from sklearn.base import BaseEstimator, RegressorMixin, clone
 import lightgbm as lgb
 import xgboost as xgb
 from catboost import CatBoostRegressor
@@ -66,7 +70,7 @@ from torch.utils.data import Dataset, DataLoader
 from torch.cuda.amp import autocast, GradScaler
 import torch.utils.checkpoint as checkpoint
 
-from sklearn.model_selection import cross_val_score, KFold, learning_curve, GridSearchCV
+from sklearn.model_selection import KFold
 import openpyxl  # 用于Excel文件操作
 from openpyxl.styles import Font, PatternFill, Alignment
 
@@ -76,7 +80,7 @@ np.random.seed(RANDOM_STATE)
 torch.manual_seed(RANDOM_STATE)
 
 # 路径配置
-OUTPUT_DIR = r"D:\Python\Python\李荆广老师课题\data\01 数据处理\最终数据\输出数据\Predict\5\集体"
+OUTPUT_DIR = r"E:\Software\codex\codex\doc\生活满意度\Life-Satisfaction-main\Life-Satisfaction-main\Data-new\Ouput\3\集体"
 # 新增子目录（用于保存插补、SHAP、H-statistic结果）
 IMPUTATION_DIR = os.path.join(OUTPUT_DIR, "imputation_quality")
 SHAP_DIR = os.path.join(OUTPUT_DIR, "shap_analysis")
@@ -98,6 +102,15 @@ if torch.cuda.is_available():
 K_NEIGHBORS = 30  # KNN插补邻居数
 CORRELATION_THRESHOLD = 0.9  # 高相关特征阈值
 TOP_FEATURES = 20  # Top20特征（SHAP+特征重要性）
+GOWER_REFERENCE_MAX = 5000  # 限制近邻候选库，避免构造全样本 n×n 距离矩阵
+GOWER_BATCH_SIZE = 256
+BIN_COUNT = 5
+N_DIST_FEATURES = 6
+# 论文所述“酌情分箱”改为显式配置，避免把国家、职业等数值编码误作连续变量。
+FORCED_CATEGORICAL_COLUMNS = {'COBN_F', 'COBN_M', 'COBN_S', 'BSMJ'}
+BINNED_CONTINUOUS_COLUMNS = {
+    'LMINS', 'MMINS', 'SMINS', 'TMINS', 'STUBMI', 'SCHSIZE', 'STRATIO', 'TOTAT'
+}
 
 # 打印配置信息
 print("=" * 80)
@@ -121,7 +134,9 @@ class RegressionDataset(Dataset):
 
 
 # -------------------- 新增：1. KNN插补（Gower距离）+ 插补质量验证 --------------------
-def knn_impute_gower(df, k=5, weighted=True):
+def knn_impute_gower(df, k=5, weighted=True, reference_df=None,
+                     reference_max=GOWER_REFERENCE_MAX,
+                     batch_size=GOWER_BATCH_SIZE):
     """
     基于Gower距离的KNN插补（适配混合类型变量，复刻VIM包逻辑）
     :param df: 包含缺失值的数据集
@@ -131,79 +146,89 @@ def knn_impute_gower(df, k=5, weighted=True):
     """
     print(f"\n   Gower KNN插补 k={k} 距离加权={weighted}")
     df_imp = df.copy()
+    reference = df.copy() if reference_df is None else reference_df.copy()
+    if list(reference.columns) != list(df_imp.columns):
+        raise ValueError("Gower插补的查询集与训练参考集字段不一致")
+    if len(reference) > reference_max:
+        reference = reference.sample(reference_max, random_state=RANDOM_STATE)
     num_cols = df_imp.select_dtypes(include=['float64', 'int64']).columns.tolist()
     cat_cols = df_imp.select_dtypes(include=['object', 'category']).columns.tolist()
 
-    # 计算Gower距离矩阵（度量混合类型变量相似性）
-    print("   计算Gower距离矩阵...")
-    gower_dist = gower.gower_matrix(df_imp)
-
-    # 遍历处理缺失样本
+    # 只对缺失行分批计算“查询样本×训练参考库”距离，避免全样本 n×n 矩阵。
+    # 验证集和测试集必须通过 reference_df 显式传入训练数据。
+    print(f"   分批计算Gower距离，训练参考库={len(reference):,}")
     missing_samples = df_imp.isnull().any(axis=1)
     processed_count = 0
     total_missing = missing_samples.sum()
 
-    for idx in range(len(df_imp)):
-        if not missing_samples.iloc[idx]:
-            continue
+    missing_positions = np.flatnonzero(missing_samples.to_numpy())
+    for batch_start in range(0, len(missing_positions), batch_size):
+        batch_positions = missing_positions[batch_start:batch_start + batch_size]
+        batch = df_imp.iloc[batch_positions]
+        gower_dist = gower.gower_matrix(batch, reference)
+
+        for local_idx, idx in enumerate(batch_positions):
 
         # 进度提示
-        processed_count += 1
-        if processed_count % 1000 == 0:
-            print(f"   已处理 {processed_count}/{total_missing} 个缺失样本")
+            processed_count += 1
+            if processed_count % 1000 == 0:
+                print(f"   已处理 {processed_count}/{total_missing} 个缺失样本")
 
         # 找到K个最近邻（排除自身）
-        dists = gower_dist[idx].copy()
-        dists[idx] = np.inf
-        nearest_neighbors = np.argsort(dists)[:k]
-        nn_dists = dists[nearest_neighbors]
-
-        # 计算距离权重
-        if weighted:
-            weights = 1 / (nn_dists + 1e-8)
-            weights = weights / weights.sum()
-        else:
-            weights = np.ones(k) / k
+            dists = np.asarray(gower_dist[local_idx], dtype=float)
+            dists[~np.isfinite(dists)] = np.inf
+            nearest_neighbors = np.argsort(dists)[:max(k * 4, k)]
 
         # 填充缺失值
-        missing_cols = df_imp.iloc[idx].isnull()
-        for col_idx, is_missing in enumerate(missing_cols):
-            if not is_missing:
-                continue
-            col_name = df_imp.columns[col_idx]
-            nn_vals = df_imp.iloc[nearest_neighbors, col_idx].dropna()
+            missing_cols = df_imp.iloc[idx].isnull()
+            for col_idx, is_missing in enumerate(missing_cols):
+                if not is_missing:
+                    continue
+                col_name = df_imp.columns[col_idx]
+                valid_neighbor_positions = [
+                    pos for pos in nearest_neighbors
+                    if np.isfinite(dists[pos]) and pd.notna(reference.iloc[pos, col_idx])
+                ][:k]
+                nn_vals = reference.iloc[valid_neighbor_positions, col_idx]
 
-            if len(nn_vals) == 0:
+                if len(nn_vals) == 0:
                 # 兜底填充（均值/众数）
-                if col_name in num_cols:
-                    fill_val = df_imp[col_name].mean() if not np.isnan(df_imp[col_name].mean()) else 0.0
+                    if col_name in num_cols:
+                        ref_mean = reference[col_name].mean()
+                        fill_val = ref_mean if pd.notna(ref_mean) else 0.0
+                    else:
+                        ref_mode = reference[col_name].mode()
+                        fill_val = ref_mode.iloc[0] if len(ref_mode) > 0 else 'Unknown'
+                elif col_name in num_cols:
+                    donor_dists = dists[valid_neighbor_positions]
+                    donor_weights = 1 / (donor_dists + 1e-8) if weighted else np.ones(len(nn_vals))
+                    donor_weights = donor_weights / donor_weights.sum()
+                    fill_val = np.average(nn_vals.astype(float), weights=donor_weights)
                 else:
-                    fill_val = df_imp[col_name].mode().iloc[0] if len(df_imp[col_name].mode()) > 0 else 'Unknown'
-            else:
-                # 加权填充
-                if col_name in num_cols:
-                    fill_val = np.average(nn_vals, weights=weights[:len(nn_vals)])
-                else:
-                    val_counts = nn_vals.value_counts()
-                    fill_val = val_counts.index[0]
+                    fill_val = nn_vals.mode().iloc[0]
 
-            df_imp.iloc[idx, col_idx] = fill_val
+                df_imp.iloc[idx, col_idx] = fill_val
 
-    # -------------------- 修复：强化NaN/无限值清理 --------------------
+    # -------------------- 强化NaN/无限值清理 --------------------
+    # 所有兜底统计量仍只允许来自训练参考库，测试/验证集自身不参与拟合。
     print("   插补后清理残留NaN/无限值...")
     # 1. 清理数值特征的NaN和无限值
     for col in num_cols:
         # 填充NaN为均值
-        col_mean = df_imp[col].mean() if not np.isnan(df_imp[col].mean()) else 0.0
-        df_imp[col] = df_imp[col].fillna(col_mean)
-        # 替换无限值为最大/最小值
-        df_imp[col] = np.clip(df_imp[col],
-                              df_imp[col].replace([np.inf, -np.inf], np.nan).min(),
-                              df_imp[col].replace([np.inf, -np.inf], np.nan).max())
+        reference_numeric = pd.to_numeric(reference[col], errors='coerce').replace([np.inf, -np.inf], np.nan)
+        reference_mean = reference_numeric.mean()
+        reference_mean = float(reference_mean) if pd.notna(reference_mean) else 0.0
+        reference_min = reference_numeric.min()
+        reference_max_value = reference_numeric.max()
+        df_imp[col] = pd.to_numeric(df_imp[col], errors='coerce').replace([np.inf, -np.inf], np.nan)
+        df_imp[col] = df_imp[col].fillna(reference_mean)
+        if pd.notna(reference_min) and pd.notna(reference_max_value):
+            df_imp[col] = np.clip(df_imp[col], reference_min, reference_max_value)
 
     # 2. 清理分类特征的NaN
     for col in cat_cols:
-        fill_val = df_imp[col].mode().iloc[0] if len(df_imp[col].mode()) > 0 else 'Unknown'
+        reference_mode = reference[col].dropna().mode()
+        fill_val = reference_mode.iloc[0] if len(reference_mode) > 0 else 'Unknown'
         df_imp[col] = df_imp[col].fillna(fill_val)
 
     # 3. 最终兜底：删除仍有NaN的行（确保无残留）
@@ -237,49 +262,109 @@ def validate_imputation_quality(df_before, df_after, target_var):
         print("   无有效数值列，跳过插补质量验证")
         return pd.DataFrame()
 
-    # 1. 分布对比（直方图）
-    print("   1. 数据分布对比...")
-    sample_cols = num_cols[:5] if len(num_cols) >= 5 else num_cols
-    fig, axes = plt.subplots(2, len(sample_cols), figsize=(20, 10))
-    fig.suptitle('Distribution Comparison Before and After Imputation', fontsize=16, fontweight='bold')
+    # 1. 缺失率与描述性统计（与独立验证脚本保持一致）
+    print("   1. 缺失率与描述性统计对比...")
+    missing_before = df_before[num_cols].isnull().mean()
+    missing_after = df_after[num_cols].isnull().mean()
+    pd.DataFrame({
+        '特征': num_cols,
+        '插补前缺失率': missing_before.reindex(num_cols).to_numpy(),
+        '插补后缺失率': missing_after.reindex(num_cols).to_numpy(),
+    }).to_csv(os.path.join(IMPUTATION_DIR, 'missing_rates.csv'), index=False, encoding='utf-8-sig')
 
+    stats_before = df_before[num_cols].describe(percentiles=[0.25, 0.5, 0.75]).T
+    stats_after = df_after[num_cols].describe(percentiles=[0.25, 0.5, 0.75]).T
+    compare_df = pd.DataFrame(index=num_cols)
+    for stat_name in ['mean', 'std', 'min', '25%', '50%', '75%', 'max']:
+        compare_df[f'before_{stat_name}'] = stats_before[stat_name]
+        compare_df[f'after_{stat_name}'] = stats_after[stat_name]
+        compare_df[f'diff_{stat_name}'] = stats_after[stat_name] - stats_before[stat_name]
+        if stat_name in ['mean', '50%']:
+            denominator = stats_before[stat_name].replace(0, np.nan)
+            compare_df[f'pct_change_{stat_name}'] = (
+                (stats_after[stat_name] - stats_before[stat_name]) / denominator * 100
+            )
+    compare_df.to_csv(os.path.join(IMPUTATION_DIR, 'descriptive_stats.csv'), encoding='utf-8-sig')
+    if 'pct_change_mean' in compare_df:
+        large_changes = compare_df[compare_df['pct_change_mean'].abs() > 5]
+        for feature, row in large_changes.iterrows():
+            print(f"      警告: {feature} 均值变化 {row['pct_change_mean']:.2f}%")
+
+    # 2. KDE分布叠加图：同一坐标轴比较插补前后
+    print("   2. 数据分布对比...")
+    sample_cols = num_cols[:min(N_DIST_FEATURES, len(num_cols))]
+    fig, axes = plt.subplots(1, len(sample_cols), figsize=(4 * len(sample_cols), 3), sharey=False)
+    axes = [axes] if len(sample_cols) == 1 else np.atleast_1d(axes)
     for idx, col in enumerate(sample_cols):
-        # 插补前
-        before_data = df_before[col].dropna()
-        axes[0, idx].hist(before_data, bins=20, alpha=0.5, color='blue', label='Before Imputation')
-        axes[0, idx].set_title(f'{col} (Before Imputation)')
-        axes[0, idx].grid(alpha=0.3)
-
-        # 插补后
-        after_data = df_after[col]
-        axes[1, idx].hist(after_data, bins=20, alpha=0.5, color='green', label='After Imputation')
-        axes[1, idx].set_title(f'{col} (After Imputation)')
-        axes[1, idx].grid(alpha=0.3)
-
+        before_values = df_before[col].dropna()
+        after_values = df_after[col].dropna()
+        if len(before_values) > 1 and len(after_values) > 1:
+            sns.kdeplot(before_values, ax=axes[idx], label='Before', fill=True,
+                        color='blue', alpha=0.5)
+            sns.kdeplot(after_values, ax=axes[idx], label='After', fill=True,
+                        color='orange', alpha=0.5)
+            axes[idx].legend(fontsize=8)
+        else:
+            axes[idx].text(0.5, 0.5, 'Insufficient data', ha='center', va='center',
+                           transform=axes[idx].transAxes)
+        axes[idx].set_title(col, fontsize=10)
     plt.tight_layout()
-    plt.savefig(os.path.join(IMPUTATION_DIR, "distribution_comparison.png"), dpi=300)
-    plt.close()
+    plt.savefig(os.path.join(IMPUTATION_DIR, 'distribution_comparison.png'),
+                dpi=200, bbox_inches='tight')
+    plt.close(fig)
 
-    # 2. 相关性结构对比
-    print("   2. 相关性结构对比...")
-    corr_before = df_before[num_cols].fillna(0).corr()
+    # 3. Pearson相关矩阵左右对照：共享色标、完整标签、数值和网格线
+    print("   3. 相关性结构对比...")
+    corr_before = df_before[num_cols].corr()
     corr_after = df_after[num_cols].corr()
+    n_features = len(num_cols)
+    width = max(16, 8 + n_features / 12)
+    fig, axes = plt.subplots(1, 2, figsize=(width, width * 0.55))
+    fig.suptitle('Correlation Matrix Comparison Before and After Imputation',
+                 fontsize=16, fontweight='bold', y=0.98)
+    if n_features <= 30:
+        label_fontsize, value_fontsize = 8, 7
+    elif n_features <= 50:
+        label_fontsize, value_fontsize = 6, 5
+    elif n_features <= 80:
+        label_fontsize, value_fontsize = 5, 3
+    else:
+        label_fontsize, value_fontsize = 4, 0
 
-    fig, axes = plt.subplots(1, 2, figsize=(20, 8))
-    im1 = axes[0].imshow(corr_before, cmap='RdBu_r', vmin=-1, vmax=1)
-    axes[0].set_title('Correlation Matrix Before Imputation')
-    plt.colorbar(im1, ax=axes[0])
+    heatmaps = []
+    for ax, corr, title in zip(
+            axes, [corr_before, corr_after], ['Before Imputation', 'After Imputation']):
+        image = ax.imshow(corr, cmap='RdYlBu_r', vmin=-1, vmax=1, interpolation='none')
+        heatmaps.append(image)
+        ax.set_title(title, fontsize=14, fontweight='bold')
+        ax.set_xticks(range(n_features))
+        ax.set_yticks(range(n_features))
+        ax.set_xticklabels(num_cols, rotation=90, fontsize=label_fontsize)
+        ax.set_yticklabels(num_cols, fontsize=label_fontsize)
+        if value_fontsize > 0:
+            for row_idx in range(n_features):
+                for col_idx in range(n_features):
+                    value = corr.iloc[row_idx, col_idx]
+                    if pd.notna(value):
+                        color = 'white' if abs(value) > 0.5 else 'black'
+                        ax.text(col_idx, row_idx, f'{value:.2f}', ha='center', va='center',
+                                fontsize=value_fontsize, color=color)
+        ax.grid(False)
+        ax.set_xticks(np.arange(n_features) - 0.5, minor=True)
+        ax.set_yticks(np.arange(n_features) - 0.5, minor=True)
+        ax.grid(which='minor', color='lightgray', linestyle='-', linewidth=0.6)
 
-    im2 = axes[1].imshow(corr_after, cmap='RdBu_r', vmin=-1, vmax=1)
-    axes[1].set_title('Correlation Matrix After Imputation')
-    plt.colorbar(im2, ax=axes[1])
+    plt.subplots_adjust(left=0.05, right=0.85, top=0.92, bottom=0.08, wspace=0.15)
+    color_axis = fig.add_axes([0.87, 0.15, 0.02, 0.7])
+    colorbar = fig.colorbar(heatmaps[0], cax=color_axis, orientation='vertical')
+    colorbar.set_label('Pearson Correlation Coefficient', fontsize=12)
+    colorbar.ax.tick_params(labelsize=10)
+    plt.savefig(os.path.join(IMPUTATION_DIR, 'correlation_comparison.png'),
+                dpi=300, bbox_inches='tight')
+    plt.close(fig)
 
-    plt.tight_layout()
-    plt.savefig(os.path.join(IMPUTATION_DIR, "correlation_comparison.png"), dpi=300)
-    plt.close()
-
-    # 3. 简单模型（线性回归）性能对比
-    print("   3. 简单模型性能对比...")
+    # 4. 简单模型（线性回归）性能对比
+    print("   4. 简单模型性能对比...")
     # -------------------- 修复：强制填充所有NaN，避免LinearRegression报错 --------------------
     X_before = df_before[num_cols].fillna(df_before[num_cols].mean()).replace([np.inf, -np.inf], 0)
     y_before = df_before[target_var].fillna(df_before[target_var].mean()).replace([np.inf, -np.inf], 0)
@@ -351,64 +436,48 @@ def validate_imputation_quality(df_before, df_after, target_var):
 
 
 # -------------------- 新增：2. H-statistic检验特征交互 --------------------
-def calculate_h_statistic(model, X, y, f1, f2):
-    """
-    计算单个特征对的H-statistic（衡量交互效应强度）
-    """
+def calculate_h_statistic(model, X, y, f1, f2, grid_size=10, sample_size=1000):
+    """按Friedman定义分别计算一维、二维部分依赖，再分解二阶H-statistic。"""
     if not isinstance(X, pd.DataFrame):
         X = pd.DataFrame(X, columns=[f"feat_{i}" for i in range(X.shape[1])])
-
-    # 构建基准数据
-    all_feature_names = X.columns.tolist()
-    fill_values = {}
-    for col in all_feature_names:
-        if X[col].dtype in ['float64', 'int64']:
-            fill_values[col] = X[col].mean()
-        else:
-            fill_values[col] = X[col].mode().iloc[0] if len(X[col].mode()) > 0 else 'Unknown'
-
-    # 构建X1（仅f1变化）、X2（仅f2变化）、X12（f1+f2变化）
-    X1 = X.copy()
-    for col in all_feature_names:
-        if col != f1:
-            X1[col] = fill_values[col]
-
-    X2 = X.copy()
-    for col in all_feature_names:
-        if col != f2:
-            X2[col] = fill_values[col]
-
-    X12 = X.copy()
-    for col in all_feature_names:
-        if col not in [f1, f2]:
-            X12[col] = fill_values[col]
-
-    # 模型预测
-    y_pred = model.predict(X)
-    y1_pred = model.predict(X1)
-    y2_pred = model.predict(X2)
-    y12_pred = model.predict(X12)
-
-    # 计算残差
-    res = y - y_pred
-    res1 = y - y1_pred
-    res2 = y - y2_pred
-    res12 = y - y12_pred
-
-    # 计算H-statistic
-    ss_res = np.sum(res ** 2)
-    ss_res12 = np.sum(res12 ** 2)
-    ss_res1 = np.sum(res1 ** 2)
-    ss_res2 = np.sum(res2 ** 2)
-
-    if ss_res == 0:
+    X_eval = X.sample(min(sample_size, len(X)), random_state=RANDOM_STATE).copy()
+    grid1 = np.unique(np.quantile(X_eval[f1], np.linspace(0.05, 0.95, grid_size)))
+    grid2 = np.unique(np.quantile(X_eval[f2], np.linspace(0.05, 0.95, grid_size)))
+    if len(grid1) < 2 or len(grid2) < 2:
         return 0.0
 
-    h_stat = (ss_res12 - np.min([ss_res1, ss_res2])) / ss_res
-    return np.clip(h_stat, 0, 1)
+    # 一维部分依赖必须独立计算，不能由二维网格简单求边际均值得到。
+    pd1 = np.zeros(len(grid1), dtype=float)
+    for i, value1 in enumerate(grid1):
+        varied = X_eval.copy()
+        varied[f1] = value1
+        pd1[i] = np.mean(model.predict(varied))
+
+    pd2 = np.zeros(len(grid2), dtype=float)
+    for j, value2 in enumerate(grid2):
+        varied = X_eval.copy()
+        varied[f2] = value2
+        pd2[j] = np.mean(model.predict(varied))
+
+    pd12 = np.zeros((len(grid1), len(grid2)), dtype=float)
+    for i, value1 in enumerate(grid1):
+        for j, value2 in enumerate(grid2):
+            varied = X_eval.copy()
+            varied[f1] = value1
+            varied[f2] = value2
+            pd12[i, j] = np.mean(model.predict(varied))
+
+    pd1 -= pd1.mean()
+    pd2 -= pd2.mean()
+    pd12 -= pd12.mean()
+    interaction = pd12 - pd1[:, np.newaxis] - pd2[np.newaxis, :]
+    denominator = np.sum(pd12 ** 2)
+    if denominator <= np.finfo(float).eps:
+        return 0.0
+    return float(np.sqrt(max(0.0, np.sum(interaction ** 2) / denominator)))
 
 
-def h_statistic_analysis(model, X, y, top_features=20):
+def h_statistic_analysis(model, X, y, top_features=20, feature_names=None):
     """
     批量检验Top20特征的交互效应
     """
@@ -417,10 +486,13 @@ def h_statistic_analysis(model, X, y, top_features=20):
         print("   特征数量不足，跳过交互检验")
         return pd.DataFrame(), []
 
-    # 选择Top20特征
+    # 优先使用外部传入的SHAP重要特征；否则再读取模型原生重要性。
     feature_importance = None
     top_feats = []
-    if hasattr(model, 'feature_importances_'):
+    if feature_names:
+        top_feats = [name for name in feature_names if name in X.columns][:top_features]
+        print(f"   使用SHAP排名前 {len(top_feats)} 个特征计算H-statistic")
+    elif hasattr(model, 'feature_importances_'):
         # ===== 新增：修复长度不匹配 - 强制对齐特征与重要性得分长度 =====
         feat_importances = model.feature_importances_
         feat_names = X.columns.tolist()
@@ -466,7 +538,10 @@ def h_statistic_analysis(model, X, y, top_features=20):
 
     # 可视化热力图
     fig, ax = plt.subplots(figsize=(12, 10))
-    im = ax.imshow(h_matrix, cmap='YlOrRd', vmin=0, vmax=np.percentile(h_matrix, 95))
+    im = ax.imshow(h_matrix, cmap='YlOrRd', vmin=0, vmax=np.percentile(h_matrix, 95),
+                   interpolation='nearest', aspect='auto')
+    ax.grid(False)
+    ax.grid(False, which='minor')
     ax.set_xticks(np.arange(len(top_feats)))
     ax.set_yticks(np.arange(len(top_feats)))
     ax.set_xticklabels(top_feats, rotation=45, ha='right')
@@ -479,7 +554,8 @@ def h_statistic_analysis(model, X, y, top_features=20):
     for i in range(len(top_feats)):
         for j in range(len(top_feats)):
             if h_matrix[i, j] > 0.01:
-                ax.text(j, i, f'{h_matrix[i, j]:.3f}', ha='center', va='center', color='white', fontsize=8)
+                ax.text(j, i, f'{h_matrix[i, j]:.3f}', ha='center', va='center',
+                        color='black', fontsize=8, fontweight='bold')
 
     plt.tight_layout()
     plt.savefig(os.path.join(H_STAT_DIR, "h_statistic_heatmap.png"), dpi=300)
@@ -616,6 +692,104 @@ def simplify_feature_engineering(X, target_series):
     print(f"   - 最终特征数：{X_final.shape[1]}")
 
     return X_final
+
+
+def fit_leakage_safe_feature_engineering(X):
+    """只在训练数据上拟合分箱、编码、标准化和相关性筛选。"""
+    X = X.copy()
+    state = {
+        'binary_maps': {}, 'category_levels': {}, 'bin_edges': {},
+        'continuous_stats': {}, 'kept_columns': []
+    }
+
+    binary_cols, categorical_cols, binned_cols, continuous_cols = [], [], [], []
+    for col in X.columns:
+        non_null = X[col].dropna()
+        unique_count = non_null.nunique()
+        if col in FORCED_CATEGORICAL_COLUMNS:
+            categorical_cols.append(col)
+        elif col in BINNED_CONTINUOUS_COLUMNS:
+            numeric = pd.to_numeric(non_null, errors='coerce').dropna()
+            if len(numeric) and numeric.nunique() >= 3:
+                binned_cols.append(col)
+            else:
+                continuous_cols.append(col)
+        elif unique_count <= 2:
+            binary_cols.append(col)
+        elif X[col].dtype == 'object' or unique_count <= 20:
+            categorical_cols.append(col)
+        else:
+            continuous_cols.append(col)
+
+    parts = []
+    for col in binary_cols:
+        levels = sorted(X[col].dropna().unique().tolist(), key=str)
+        mapping = {value: idx for idx, value in enumerate(levels)}
+        state['binary_maps'][col] = mapping
+        parts.append(pd.DataFrame({col: X[col].map(mapping).fillna(0).astype(float)}, index=X.index))
+
+    for col in categorical_cols:
+        levels = sorted(X[col].dropna().astype(str).unique().tolist())
+        state['category_levels'][col] = levels
+        values = X[col].astype(str).where(X[col].notna(), '__MISSING__')
+        cat = pd.Categorical(values, categories=levels)
+        parts.append(pd.get_dummies(cat, prefix=col, dtype=float).set_axis(X.index))
+
+    for col in binned_cols:
+        numeric = pd.to_numeric(X[col], errors='coerce')
+        edges = np.unique(numeric.quantile(np.linspace(0, 1, BIN_COUNT + 1)).to_numpy())
+        if len(edges) < 3:
+            continuous_cols.append(col)
+            continue
+        edges[0], edges[-1] = -np.inf, np.inf
+        state['bin_edges'][col] = edges
+        bins = pd.cut(numeric, bins=edges, labels=False, include_lowest=True)
+        levels = list(range(len(edges) - 1))
+        state['category_levels'][f'__bin__{col}'] = levels
+        cat = pd.Categorical(bins, categories=levels)
+        parts.append(pd.get_dummies(cat, prefix=col, dtype=float).set_axis(X.index))
+
+    for col in dict.fromkeys(continuous_cols):
+        numeric = pd.to_numeric(X[col], errors='coerce')
+        mean = float(numeric.mean()) if pd.notna(numeric.mean()) else 0.0
+        std = float(numeric.std(ddof=0)) if pd.notna(numeric.std(ddof=0)) and numeric.std(ddof=0) > 0 else 1.0
+        state['continuous_stats'][col] = (mean, std)
+        parts.append(pd.DataFrame({col: (numeric.fillna(mean) - mean) / std}, index=X.index))
+
+    encoded = pd.concat(parts, axis=1).astype(float)
+    corr = encoded.corr().abs()
+    upper = corr.where(np.triu(np.ones(corr.shape), k=1).astype(bool))
+    drop_cols = [col for col in upper.columns if (upper[col] > CORRELATION_THRESHOLD).any()]
+    encoded = encoded.drop(columns=drop_cols)
+    state['kept_columns'] = encoded.columns.tolist()
+    state['input_columns'] = X.columns.tolist()
+    print(f"   - 训练集拟合分箱变量: {binned_cols}")
+    print(f"   - 训练集拟合后保留特征数: {encoded.shape[1]}")
+    return encoded, state
+
+
+def transform_leakage_safe_feature_engineering(X, state):
+    """使用训练数据中保存的边界、类别和统计量转换验证/测试数据。"""
+    X = X.reindex(columns=state['input_columns']).copy()
+    parts = []
+    for col, mapping in state['binary_maps'].items():
+        parts.append(pd.DataFrame({col: X[col].map(mapping).fillna(0).astype(float)}, index=X.index))
+    for col, levels in state['category_levels'].items():
+        if col.startswith('__bin__'):
+            raw_col = col.replace('__bin__', '', 1)
+            values = pd.cut(pd.to_numeric(X[raw_col], errors='coerce'),
+                            bins=state['bin_edges'][raw_col], labels=False, include_lowest=True)
+            prefix = raw_col
+        else:
+            values = X[col].astype(str).where(X[col].notna(), '__MISSING__')
+            prefix = col
+        cat = pd.Categorical(values, categories=levels)
+        parts.append(pd.get_dummies(cat, prefix=prefix, dtype=float).set_axis(X.index))
+    for col, (mean, std) in state['continuous_stats'].items():
+        numeric = pd.to_numeric(X[col], errors='coerce').fillna(mean)
+        parts.append(pd.DataFrame({col: (numeric - mean) / std}, index=X.index))
+    encoded = pd.concat(parts, axis=1).astype(float)
+    return encoded.reindex(columns=state['kept_columns'], fill_value=0.0)
 
 
 # -------------------- 保留：模型定义（Transformer/ResMLP） --------------------
@@ -865,7 +1039,7 @@ def filter_outliers_mild(X, y, z_threshold=4, max_outlier_features_pct=0.1):
 print("\n" + "数据加载与预处理".center(80, "-"))
 print("\n1.1 加载原始数据...")
 # 数据路径
-df_raw = pd.read_excel(r"D:\Python\Python\李荆广老师课题\data\01 数据处理\最终数据\训练数据\集体文化主义国家.xlsx")
+df_raw = pd.read_excel(r"E:\Software\codex\codex\doc\生活满意度\Life-Satisfaction-main\Life-Satisfaction-main\Data-new\Input\集体\集体文化主义国家.xlsx")
 target_variable = 'ST016Q01NA'
 
 # 基础信息输出
@@ -884,122 +1058,37 @@ print(f"   - 清洗后样本数: {len(df_clean)} (剔除无效样本: {len(df_ra
 print(f"   - 清洗后特征数: {X_raw.shape[1]}")
 print(f"   - 目标变量统计: 均值={y.mean():.2f}, 标准差={y.std():.2f}, 范围=[{y.min():.0f}, {y.max():.0f}]")
 
-# 1.3 缺失值处理：KNN插补（Gower距离）
-print("\n1.3 缺失值处理：KNN插补（Gower距离）...")
-df_for_imputation = pd.concat([X_raw, y.rename(target_variable)], axis=1)
-df_before_imputation = df_for_imputation.copy()
-
-# 执行KNN插补
-df_after_imputation = knn_impute_gower(
-    df_for_imputation,
-    k=K_NEIGHBORS,
-    weighted=True
-)
-
-# 验证插补质量
-impute_metrics = validate_imputation_quality(
-    df_before_imputation,
-    df_after_imputation,
-    target_variable
-)
-
-# 分离插补后的特征和目标变量
-X_imputed = df_after_imputation.drop(columns=[target_variable])
-y_imputed = df_after_imputation[target_variable]
-
-# -------------------- 2. 简化版特征工程（增强版） --------------------
-print("\n" + "特征工程".center(80, "-"))
-X_enhanced = simplify_feature_engineering(X_imputed, y_imputed)
-print(f"\n2.6 特征工程最终结果汇总:")
-print(f"   - 原始特征数: {X_imputed.shape[1]}")
-print(f"   - 处理后特征数: {X_enhanced.shape[1]}")
-print(
-    f"   - 特征变化: {'减少' if X_enhanced.shape[1] < X_imputed.shape[1] else '增加'} {abs(X_enhanced.shape[1] - X_imputed.shape[1])} 个（编码+高相关剔除）")
-
-# -------------------- 3. 数据划分（8:2，无验证集） --------------------
+# -------------------- 2. 先划分，再拟合任何数据驱动预处理 --------------------
 print("\n" + "数据划分 8:2 训练/测试".center(80, "-"))
-print("\n3.1 划分训练集/测试集（8:2）")
+print("\n2.1 划分训练集/测试集（8:2）")
 X_tr_raw, X_te_raw, y_tr, y_te = train_test_split(
-    X_enhanced, y_imputed, test_size=0.2, random_state=RANDOM_STATE,
-    stratify=pd.cut(y_imputed, bins=5)
+    X_raw, y, test_size=0.2, random_state=RANDOM_STATE,
+    stratify=pd.cut(y, bins=5, duplicates='drop')
 )
 print(f"   - 训练集: {len(X_tr_raw)} 样本（80%）")
 print(f"   - 测试集: {len(X_te_raw)} 样本（20%）")
 
-# 3.2 特征类型统计
-num_cols = X_tr_raw.select_dtypes(include='number').columns
-cat_cols = []
-print(f"\n3.2 特征类型统计:")
-print(f"   - 数值特征数: {len(num_cols)}")
-print(f"   - 类别特征数: {len(cat_cols)}（已完成编码，无原始类别特征）")
+# -------------------- 3. 训练参考库Gower插补 --------------------
+print("\n3.1 Gower-KNN插补（目标列不参与距离）")
+X_tr_imputed = knn_impute_gower(X_tr_raw, k=K_NEIGHBORS, weighted=True)
+X_te_imputed = knn_impute_gower(
+    X_te_raw, k=K_NEIGHBORS, weighted=True, reference_df=X_tr_raw
+)
+assert target_variable not in X_tr_imputed.columns
 
-# 3.3 缺失值处理（插补后无缺失，仅兜底）
-print("\n3.3 缺失值处理（兜底填充）:")
-num_imputer = SimpleImputer(strategy='mean')
-X_tr_num = pd.DataFrame(num_imputer.fit_transform(X_tr_raw[num_cols]), columns=num_cols, index=X_tr_raw.index)
-X_te_num = pd.DataFrame(num_imputer.transform(X_te_raw[num_cols]), columns=num_cols, index=X_te_raw.index)
-missing_ratio = X_tr_raw[num_cols].isnull().sum().sum() / (X_tr_raw[num_cols].shape[0] * X_tr_raw[num_cols].shape[1])
-print(f"   - 数值特征: 均值填充（填充缺失值比例: {missing_ratio:.1%}）")
+# 插补质量仅在训练集上核查；拼接目标列只是用于评价，不参与距离计算。
+impute_metrics = validate_imputation_quality(
+    pd.concat([X_tr_raw, y_tr.rename(target_variable)], axis=1),
+    pd.concat([X_tr_imputed, y_tr.rename(target_variable)], axis=1),
+    target_variable
+)
 
-# 合并特征
-X_tr_imputed = X_tr_num.copy()
-X_te_imputed = X_te_num.copy()
+# -------------------- 4. 训练集拟合分箱、编码、标准化和相关性筛选 --------------------
+print("\n4.1 无泄漏特征工程（含宽范围变量分箱）")
+X_tr_imputed, preprocessing_state = fit_leakage_safe_feature_engineering(X_tr_imputed)
+X_te_imputed = transform_leakage_safe_feature_engineering(X_te_imputed, preprocessing_state)
 
-# 3.4 特征选择（可自动扩展到更多/全部特征）
-print("\n3.4 特征选择（融合F检验、互信息、随机森林重要性）")
-TOTAL_FEATURES_AVAILABLE = X_tr_imputed.shape[1]
-
-# 说明：
-# - 你提出“30个可能偏少”，这里会在若干候选数量（包含全部特征）中，快速用5折CV选择 R² 最好的特征数量
-# - 最终训练仍使用“选中的特征集合”；但后续分析（SHAP/重要性/交互）仍固定展示 Top20（不变）
-def _choose_feature_count_by_cv(X_train_all, y_train, candidate_ns):
-    candidate_ns = [int(n) for n in candidate_ns if 1 <= int(n) <= X_train_all.shape[1]]
-    candidate_ns = sorted(list(dict.fromkeys(candidate_ns)))  # 去重保序
-    if len(candidate_ns) == 0:
-        return min(30, X_train_all.shape[1])
-
-    # 这里不能依赖全局 kf（因为本函数调用点早于 kf 的定义），因此函数内自建 5 折 KFold
-    kf_probe = KFold(n_splits=5, shuffle=True, random_state=RANDOM_STATE)
-
-    # 轻量基准模型：用于快速比较“特征数量”对泛化的影响（避免把主流程训练成本再放大）
-    probe_model = lgb.LGBMRegressor(
-        n_estimators=250,
-        learning_rate=0.05,
-        num_leaves=63,
-        random_state=RANDOM_STATE,
-        n_jobs=1,
-        verbose=-1,
-        force_col_wise=True
-    )
-
-    best_n = candidate_ns[0]
-    best_score = -np.inf
-    print(f"   - 可用特征总数: {X_train_all.shape[1]}，候选特征数: {candidate_ns}")
-    for n in candidate_ns:
-        feats_n, _ = select_top_features(X_train_all, y_train, top_n=n)
-        Xn = X_train_all[feats_n]
-        try:
-            scores = cross_val_score(probe_model, Xn, y_train, cv=kf_probe, scoring='r2', n_jobs=1)
-            mean_r2 = float(np.mean(scores))
-            std_r2 = float(np.std(scores))
-            print(f"   - 候选 Top{n:>4}: CV R²={mean_r2:.4f} ± {std_r2:.4f}")
-            if mean_r2 > best_score:
-                best_score = mean_r2
-                best_n = n
-        except Exception as e:
-            print(f"   - 候选 Top{n:>4}: CV 失败，跳过（{str(e)[:60]}）")
-    print(f"   => 选定特征数: Top{best_n}（probe CV R² 最优={best_score:.4f}）")
-    return best_n
-
-# 候选特征数量策略：在30基础上增加到60/100，并加入“全部特征”
-candidate_feature_ns = [
-    30,
-    60,
-    100,
-    TOTAL_FEATURES_AVAILABLE
-]
-best_top_n = _choose_feature_count_by_cv(X_tr_imputed, y_tr, candidate_feature_ns)
-
+best_top_n = min(100, X_tr_imputed.shape[1])
 top_features, feature_scores = select_top_features(X_tr_imputed, y_tr, top_n=best_top_n)
 X_tr_selected = X_tr_imputed[top_features]
 X_te_selected = X_te_imputed[top_features]
@@ -1026,6 +1115,67 @@ y_tr_final = y_tr_clean
 X_te_final = X_te_selected
 y_te_final = y_te
 
+
+def prepare_leakage_safe_cv_folds(X_source, y_source, n_splits=5):
+    """每个验证折独立拟合插补、分箱、编码、缩放、相关过滤和监督特征选择。"""
+    splitter = KFold(n_splits=n_splits, shuffle=True, random_state=RANDOM_STATE)
+    prepared = []
+    for fold_no, (train_idx, val_idx) in enumerate(splitter.split(X_source), 1):
+        print(f"   准备无泄漏CV第{fold_no}折...")
+        X_fold_train_raw = X_source.iloc[train_idx]
+        X_fold_val_raw = X_source.iloc[val_idx]
+        y_fold_train = y_source.iloc[train_idx]
+        y_fold_val = y_source.iloc[val_idx]
+        X_fold_train = knn_impute_gower(X_fold_train_raw, k=K_NEIGHBORS, weighted=True)
+        X_fold_val = knn_impute_gower(
+            X_fold_val_raw, k=K_NEIGHBORS, weighted=True,
+            reference_df=X_fold_train_raw
+        )
+        X_fold_train, fold_state = fit_leakage_safe_feature_engineering(X_fold_train)
+        X_fold_val = transform_leakage_safe_feature_engineering(X_fold_val, fold_state)
+        fold_features, _ = select_top_features(
+            X_fold_train, y_fold_train, top_n=min(best_top_n, X_fold_train.shape[1])
+        )
+        X_fold_train_selected, y_fold_train_selected = filter_outliers_mild(
+            X_fold_train[fold_features], y_fold_train,
+            z_threshold=4, max_outlier_features_pct=0.1
+        )
+        prepared.append({
+            'X_train': X_fold_train_selected,
+            'X_val': X_fold_val[fold_features],
+            'y_train': y_fold_train_selected,
+            'y_val': y_fold_val,
+            'features': fold_features,
+        })
+    return prepared
+
+
+def leakage_safe_cv(estimator, use_additional_scaling=False):
+    """在已经按折隔离拟合的特征上训练并评价估计器。"""
+    scores = {'MAE': [], 'RMSE': [], 'R2': []}
+    for fold in prepared_cv_folds:
+        X_fit, X_val = fold['X_train'], fold['X_val']
+        if use_additional_scaling:
+            fold_scaler = StandardScaler()
+            X_fit = pd.DataFrame(fold_scaler.fit_transform(X_fit), columns=X_fit.columns, index=X_fit.index)
+            X_val = pd.DataFrame(fold_scaler.transform(X_val), columns=X_val.columns, index=X_val.index)
+        model = clone(estimator)
+        model.fit(X_fit, fold['y_train'])
+        pred = model.predict(X_val)
+        scores['MAE'].append(mean_absolute_error(fold['y_val'], pred))
+        scores['RMSE'].append(np.sqrt(mean_squared_error(fold['y_val'], pred)))
+        scores['R2'].append(r2_score(fold['y_val'], pred))
+    scores = {key: np.asarray(value) for key, value in scores.items()}
+    return {
+        **scores,
+        'Mean_MAE': scores['MAE'].mean(), 'Std_MAE': scores['MAE'].std(),
+        'Mean_RMSE': scores['RMSE'].mean(), 'Std_RMSE': scores['RMSE'].std(),
+        'Mean_R2': scores['R2'].mean(), 'Std_R2': scores['R2'].std(),
+    }
+
+
+prepared_cv_folds = prepare_leakage_safe_cv_folds(X_tr_raw, y_tr)
+
 # 保存处理后数据
 print("\n3.7 保存处理后数据文件:")
 X_tr_final.assign(target=y_tr_final).to_csv(os.path.join(OUTPUT_DIR, "train.csv"), index=False)
@@ -1049,61 +1199,15 @@ scoring_metrics = {
 # 创建Excel保存路径
 cv_excel_path = os.path.join(OUTPUT_DIR, "5fold_cross_validation_results.xlsx")
 
-# ===================== 新增：超参数网格搜索（GridSearchCV） =====================
-print("\n" + "超参数网格搜索 GridSearchCV".center(80, "-"))
-best_params = {}
-# SVR
-param_grid_svr = {'C': [0.5, 1.0, 2.0], 'gamma': ['scale', 'auto'], 'epsilon': [0.05, 0.1]}
-X_tr_scaled_gs = StandardScaler().fit_transform(X_tr_final)
-try:
-    gs_svr = GridSearchCV(SVR(kernel='rbf'), param_grid_svr, cv=3, scoring='r2', n_jobs=1, verbose=0)
-    gs_svr.fit(X_tr_scaled_gs, y_tr_final)
-    best_params['SVR'] = gs_svr.best_params_
-    print(f"   SVR 最优: {gs_svr.best_params_} CV R²={gs_svr.best_score_:.4f}")
-except Exception as e:
-    print(f"   SVR 网格搜索跳过: {str(e)[:60]}")
-# RandomForest
-param_grid_rf = {'n_estimators': [200, 400], 'max_depth': [10, 15], 'min_samples_leaf': [2, 4]}
-try:
-    gs_rf = GridSearchCV(RandomForestRegressor(random_state=RANDOM_STATE, n_jobs=1), param_grid_rf, cv=3, scoring='r2', n_jobs=1, verbose=0)
-    gs_rf.fit(X_tr_final, y_tr_final)
-    best_params['RandomForest'] = gs_rf.best_params_
-    print(f"   RandomForest 最优: {gs_rf.best_params_} CV R²={gs_rf.best_score_:.4f}")
-except Exception as e:
-    print(f"   RandomForest 网格搜索跳过: {str(e)[:60]}")
-# LightGBM
-param_grid_lgb = {'n_estimators': [400, 600], 'max_depth': [8, 10], 'learning_rate': [0.05, 0.08]}
-try:
-    gs_lgb = GridSearchCV(lgb.LGBMRegressor(random_state=RANDOM_STATE, verbose=-1, n_jobs=1), param_grid_lgb, cv=3, scoring='r2', n_jobs=1, verbose=0)
-    gs_lgb.fit(X_tr_final, y_tr_final)
-    best_params['LightGBM'] = gs_lgb.best_params_
-    print(f"   LightGBM 最优: {gs_lgb.best_params_} CV R²={gs_lgb.best_score_:.4f}")
-except Exception as e:
-    print(f"   LightGBM 网格搜索跳过: {str(e)[:60]}")
-# XGBoost
-param_grid_xgb = {'n_estimators': [400, 600], 'max_depth': [8, 10], 'learning_rate': [0.05, 0.08]}
-try:
-    gs_xgb = GridSearchCV(xgb.XGBRegressor(random_state=RANDOM_STATE, verbosity=0, n_jobs=1), param_grid_xgb, cv=3, scoring='r2', n_jobs=1, verbose=0)
-    gs_xgb.fit(X_tr_final, y_tr_final)
-    best_params['XGBoost'] = gs_xgb.best_params_
-    print(f"   XGBoost 最优: {gs_xgb.best_params_} CV R²={gs_xgb.best_score_:.4f}")
-except Exception as e:
-    print(f"   XGBoost 网格搜索跳过: {str(e)[:60]}")
-# CatBoost
-param_grid_cat = {'iterations': [400, 600], 'depth': [8, 10], 'learning_rate': [0.05, 0.08]}
-try:
-    gs_cat = GridSearchCV(CatBoostRegressor(random_state=RANDOM_STATE, verbose=0), param_grid_cat, cv=3, scoring='r2', n_jobs=1, verbose=0)
-    gs_cat.fit(X_tr_final, y_tr_final)
-    best_params['CatBoost'] = gs_cat.best_params_
-    print(f"   CatBoost 最优: {gs_cat.best_params_} CV R²={gs_cat.best_score_:.4f}")
-except Exception as e:
-    print(f"   CatBoost 网格搜索跳过: {str(e)[:60]}")
-# 保存网格搜索结果
-if best_params:
-    pd.DataFrame.from_dict(best_params, orient='index').to_csv(
-        os.path.join(OUTPUT_DIR, "grid_search_best_params.csv"))
-    print(f"   最优参数已保存: grid_search_best_params.csv")
-# ===================== 网格搜索结束 =====================
+# 超参数采用预先固定的研究方案，避免使用同一五折结果同时调参与报告性能。
+# 如需系统调参，应在每个外层训练折内部增加独立的内层CV。
+best_params = {
+    'SVR': {'C': 1.0, 'gamma': 'scale', 'epsilon': 0.1},
+    'RandomForest': {'n_estimators': 400, 'max_depth': 15, 'min_samples_leaf': 2},
+    'LightGBM': {'n_estimators': 600, 'max_depth': 10, 'learning_rate': 0.05},
+    'XGBoost': {'n_estimators': 600, 'max_depth': 10, 'learning_rate': 0.05},
+    'CatBoost': {'iterations': 600, 'depth': 10, 'learning_rate': 0.05},
+}
 
 # -------------------- 4. 模型训练流程（增强版：新增MLR/Lasso/SVR） --------------------
 print("\n" + "模型训练".center(80, "-"))
@@ -1130,27 +1234,7 @@ print(f"   MLR 完成 {train_time:.2f}s")
 
 # ===================== 新增：MLR五折交叉验证 =====================
 print("   MLR 五折CV...")
-mlr_cv_scores = {}
-for metric_name, metric in scoring_metrics.items():
-    # 执行交叉验证
-    scores = cross_val_score(mlr_model, X_tr_final, y_tr_final, cv=kf, scoring=metric, n_jobs=1)
-    # 处理负分（MAE/RMSE是负的，需要取反）
-    if metric_name in ['MAE', 'RMSE']:
-        scores = -scores
-    mlr_cv_scores[metric_name] = scores
-
-# 存储结果
-cv_results['MLR'] = {
-    'MAE': mlr_cv_scores['MAE'],
-    'RMSE': mlr_cv_scores['RMSE'],
-    'R2': mlr_cv_scores['R2'],
-    'Mean_MAE': np.mean(mlr_cv_scores['MAE']),
-    'Mean_RMSE': np.mean(mlr_cv_scores['RMSE']),
-    'Mean_R2': np.mean(mlr_cv_scores['R2']),
-    'Std_MAE': np.std(mlr_cv_scores['MAE']),
-    'Std_RMSE': np.std(mlr_cv_scores['RMSE']),
-    'Std_R2': np.std(mlr_cv_scores['R2'])
-}
+cv_results['MLR'] = leakage_safe_cv(LinearRegression())
 
 # 打印MLR交叉验证结果
 print(f"   MLR CV:")
@@ -1161,35 +1245,18 @@ print(f"      R2: {cv_results['MLR']['Mean_R2']:.4f} ± {cv_results['MLR']['Std_
 # 4.2 新增：Lasso回归
 print("\n4.2 训练Lasso回归模型...")
 start_time = time.time()
-lasso_cv = LassoCV(cv=5, random_state=RANDOM_STATE, max_iter=10000)
-lasso_cv.fit(X_tr_final, y_tr_final)
-lasso_model = Lasso(alpha=lasso_cv.alpha_, random_state=RANDOM_STATE)
+lasso_model = Lasso(alpha=0.001, random_state=RANDOM_STATE, max_iter=10000)
 lasso_model.fit(X_tr_final, y_tr_final)
 predictions['Lasso'] = lasso_model.predict(X_te_final)
 trained_models['Lasso'] = lasso_model
 train_time = time.time() - start_time
-print(f"   Lasso 完成 {train_time:.2f}s alpha={lasso_cv.alpha_:.6f}")
+print(f"   Lasso 完成 {train_time:.2f}s alpha={lasso_model.alpha:.6f}")
 
 # ===================== 新增：Lasso五折交叉验证 =====================
 print("   Lasso 五折CV...")
-lasso_cv_scores = {}
-for metric_name, metric in scoring_metrics.items():
-    scores = cross_val_score(lasso_model, X_tr_final, y_tr_final, cv=kf, scoring=metric, n_jobs=1)
-    if metric_name in ['MAE', 'RMSE']:
-        scores = -scores
-    lasso_cv_scores[metric_name] = scores
-
-cv_results['Lasso'] = {
-    'MAE': lasso_cv_scores['MAE'],
-    'RMSE': lasso_cv_scores['RMSE'],
-    'R2': lasso_cv_scores['R2'],
-    'Mean_MAE': np.mean(lasso_cv_scores['MAE']),
-    'Mean_RMSE': np.mean(lasso_cv_scores['RMSE']),
-    'Mean_R2': np.mean(lasso_cv_scores['R2']),
-    'Std_MAE': np.std(lasso_cv_scores['MAE']),
-    'Std_RMSE': np.std(lasso_cv_scores['RMSE']),
-    'Std_R2': np.std(lasso_cv_scores['R2'])
-}
+cv_results['Lasso'] = leakage_safe_cv(
+    Lasso(alpha=lasso_model.alpha, random_state=RANDOM_STATE, max_iter=10000)
+)
 
 print(f"   Lasso CV:")
 print(f"      MAE: {cv_results['Lasso']['Mean_MAE']:.4f} ± {cv_results['Lasso']['Std_MAE']:.4f}")
@@ -1209,25 +1276,10 @@ print(f"   SVR 完成 {train_time:.2f}s")
 
 # ===================== 新增：SVR五折交叉验证 =====================
 print("   SVR 五折CV...")
-svr_cv_scores = {}
-for metric_name, metric in scoring_metrics.items():
-    # SVR使用标准化后的训练数据
-    scores = cross_val_score(svr_model, X_tr_scaled, y_tr_final, cv=kf, scoring=metric, n_jobs=1)
-    if metric_name in ['MAE', 'RMSE']:
-        scores = -scores
-    svr_cv_scores[metric_name] = scores
-
-cv_results['SVR'] = {
-    'MAE': svr_cv_scores['MAE'],
-    'RMSE': svr_cv_scores['RMSE'],
-    'R2': svr_cv_scores['R2'],
-    'Mean_MAE': np.mean(svr_cv_scores['MAE']),
-    'Mean_RMSE': np.mean(svr_cv_scores['RMSE']),
-    'Mean_R2': np.mean(svr_cv_scores['R2']),
-    'Std_MAE': np.std(svr_cv_scores['MAE']),
-    'Std_RMSE': np.std(svr_cv_scores['RMSE']),
-    'Std_R2': np.std(svr_cv_scores['R2'])
-}
+cv_results['SVR'] = leakage_safe_cv(
+    SVR(kernel='rbf', **{k: v for k, v in svr_params.items() if k in ['C', 'gamma', 'epsilon']}),
+    use_additional_scaling=True
+)
 
 print(f"   SVR CV:")
 print(f"      MAE: {cv_results['SVR']['Mean_MAE']:.4f} ± {cv_results['SVR']['Std_MAE']:.4f}")
@@ -1251,24 +1303,7 @@ print(f"   RandomForest 完成 {train_time:.2f}s OOB={rf_model.oob_score_:.4f}")
 
 # ===================== 新增：RandomForest五折交叉验证 =====================
 print("   RandomForest 五折CV...")
-rf_cv_scores = {}
-for metric_name, metric in scoring_metrics.items():
-    scores = cross_val_score(rf_model, X_tr_final, y_tr_final, cv=kf, scoring=metric, n_jobs=1)
-    if metric_name in ['MAE', 'RMSE']:
-        scores = -scores
-    rf_cv_scores[metric_name] = scores
-
-cv_results['RandomForest'] = {
-    'MAE': rf_cv_scores['MAE'],
-    'RMSE': rf_cv_scores['RMSE'],
-    'R2': rf_cv_scores['R2'],
-    'Mean_MAE': np.mean(rf_cv_scores['MAE']),
-    'Mean_RMSE': np.mean(rf_cv_scores['RMSE']),
-    'Mean_R2': np.mean(rf_cv_scores['R2']),
-    'Std_MAE': np.std(rf_cv_scores['MAE']),
-    'Std_RMSE': np.std(rf_cv_scores['RMSE']),
-    'Std_R2': np.std(rf_cv_scores['R2'])
-}
+cv_results['RandomForest'] = leakage_safe_cv(clone(rf_model).set_params(oob_score=False))
 
 print(f"   RandomForest CV:")
 print(f"      MAE: {cv_results['RandomForest']['Mean_MAE']:.4f} ± {cv_results['RandomForest']['Std_MAE']:.4f}")
@@ -1295,24 +1330,7 @@ print(f"   LightGBM 完成 {train_time:.2f}s n_est={lgb_model.n_estimators_}")
 
 # ===================== 新增：LightGBM五折交叉验证 =====================
 print("   LightGBM 五折CV...")
-lgb_cv_scores = {}
-for metric_name, metric in scoring_metrics.items():
-    scores = cross_val_score(lgb_model, X_tr_final, y_tr_final, cv=kf, scoring=metric, n_jobs=1)
-    if metric_name in ['MAE', 'RMSE']:
-        scores = -scores
-    lgb_cv_scores[metric_name] = scores
-
-cv_results['LightGBM'] = {
-    'MAE': lgb_cv_scores['MAE'],
-    'RMSE': lgb_cv_scores['RMSE'],
-    'R2': lgb_cv_scores['R2'],
-    'Mean_MAE': np.mean(lgb_cv_scores['MAE']),
-    'Mean_RMSE': np.mean(lgb_cv_scores['RMSE']),
-    'Mean_R2': np.mean(lgb_cv_scores['R2']),
-    'Std_MAE': np.std(lgb_cv_scores['MAE']),
-    'Std_RMSE': np.std(lgb_cv_scores['RMSE']),
-    'Std_R2': np.std(lgb_cv_scores['R2'])
-}
+cv_results['LightGBM'] = leakage_safe_cv(lgb.LGBMRegressor(**lgb_params))
 
 print(f"   LightGBM CV:")
 print(f"      MAE: {cv_results['LightGBM']['Mean_MAE']:.4f} ± {cv_results['LightGBM']['Std_MAE']:.4f}")
@@ -1337,24 +1355,7 @@ print(f"   XGBoost 完成 {train_time:.2f}s")
 
 # ===================== 新增：XGBoost五折交叉验证 =====================
 print("   XGBoost 五折CV...")
-xgb_cv_scores = {}
-for metric_name, metric in scoring_metrics.items():
-    scores = cross_val_score(xgb_model, X_tr_final, y_tr_final, cv=kf, scoring=metric, n_jobs=1)
-    if metric_name in ['MAE', 'RMSE']:
-        scores = -scores
-    xgb_cv_scores[metric_name] = scores
-
-cv_results['XGBoost'] = {
-    'MAE': xgb_cv_scores['MAE'],
-    'RMSE': xgb_cv_scores['RMSE'],
-    'R2': xgb_cv_scores['R2'],
-    'Mean_MAE': np.mean(xgb_cv_scores['MAE']),
-    'Mean_RMSE': np.mean(xgb_cv_scores['RMSE']),
-    'Mean_R2': np.mean(xgb_cv_scores['R2']),
-    'Std_MAE': np.std(xgb_cv_scores['MAE']),
-    'Std_RMSE': np.std(xgb_cv_scores['RMSE']),
-    'Std_R2': np.std(xgb_cv_scores['R2'])
-}
+cv_results['XGBoost'] = leakage_safe_cv(xgb.XGBRegressor(**xgb_params))
 
 print(f"   XGBoost CV:")
 print(f"      MAE: {cv_results['XGBoost']['Mean_MAE']:.4f} ± {cv_results['XGBoost']['Std_MAE']:.4f}")
@@ -1379,24 +1380,7 @@ print(f"   CatBoost 完成 {train_time:.2f}s")
 
 # ===================== 新增：CatBoost五折交叉验证 =====================
 print("   CatBoost 五折CV...")
-cat_cv_scores = {}
-for metric_name, metric in scoring_metrics.items():
-    scores = cross_val_score(cat_model, X_tr_final, y_tr_final, cv=kf, scoring=metric, n_jobs=1)
-    if metric_name in ['MAE', 'RMSE']:
-        scores = -scores
-    cat_cv_scores[metric_name] = scores
-
-cv_results['CatBoost'] = {
-    'MAE': cat_cv_scores['MAE'],
-    'RMSE': cat_cv_scores['RMSE'],
-    'R2': cat_cv_scores['R2'],
-    'Mean_MAE': np.mean(cat_cv_scores['MAE']),
-    'Mean_RMSE': np.mean(cat_cv_scores['RMSE']),
-    'Mean_R2': np.mean(cat_cv_scores['R2']),
-    'Std_MAE': np.std(cat_cv_scores['MAE']),
-    'Std_RMSE': np.std(cat_cv_scores['RMSE']),
-    'Std_R2': np.std(cat_cv_scores['R2'])
-}
+cv_results['CatBoost'] = leakage_safe_cv(CatBoostRegressor(**cat_params))
 
 print(f"   CatBoost CV:")
 print(f"      MAE: {cv_results['CatBoost']['Mean_MAE']:.4f} ± {cv_results['CatBoost']['Std_MAE']:.4f}")
@@ -1423,16 +1407,22 @@ try:
     trf_cv_scores = {'MAE': [], 'RMSE': [], 'R2': []}
 
     # 手动实现深度学习模型的五折交叉验证
-    for fold, (train_idx, val_idx) in enumerate(kf.split(X_tr_scaled)):
+    for fold, prepared_fold in enumerate(prepared_cv_folds):
         print(f"      正在执行Transformer第{fold + 1}折验证...")
-        # 划分折内训练/验证数据
-        X_fold_tr = X_tr_scaled.iloc[train_idx]
-        y_fold_tr = y_tr_final.iloc[train_idx]
-        X_fold_val = X_tr_scaled.iloc[val_idx]
-        y_fold_val = y_tr_final.iloc[val_idx]
+        fold_scaler = StandardScaler()
+        X_fold_tr = pd.DataFrame(
+            fold_scaler.fit_transform(prepared_fold['X_train']),
+            columns=prepared_fold['X_train'].columns, index=prepared_fold['X_train'].index
+        )
+        X_fold_val = pd.DataFrame(
+            fold_scaler.transform(prepared_fold['X_val']),
+            columns=prepared_fold['X_val'].columns, index=prepared_fold['X_val'].index
+        )
+        y_fold_tr = prepared_fold['y_train']
+        y_fold_val = prepared_fold['y_val']
 
         # 训练折内模型
-        fold_model = TransformerRegressor(n_features=X_tr_final.shape[1])
+        fold_model = TransformerRegressor(n_features=X_fold_tr.shape[1])
         fold_model_trained, fold_y_mean, fold_y_std, _ = train_gpu_model(
             fold_model, f"Transformer_Fold{fold + 1}", X_fold_tr, y_fold_tr,
             epochs=100, lr=5e-4, batch_size=512
@@ -1500,14 +1490,21 @@ try:
     mlp_cv_scores = {'MAE': [], 'RMSE': [], 'R2': []}
 
     # 手动实现ResMLP的五折交叉验证
-    for fold, (train_idx, val_idx) in enumerate(kf.split(X_tr_scaled)):
+    for fold, prepared_fold in enumerate(prepared_cv_folds):
         print(f"      正在执行ResMLP第{fold + 1}折验证...")
-        X_fold_tr = X_tr_scaled.iloc[train_idx]
-        y_fold_tr = y_tr_final.iloc[train_idx]
-        X_fold_val = X_tr_scaled.iloc[val_idx]
-        y_fold_val = y_tr_final.iloc[val_idx]
+        fold_scaler = StandardScaler()
+        X_fold_tr = pd.DataFrame(
+            fold_scaler.fit_transform(prepared_fold['X_train']),
+            columns=prepared_fold['X_train'].columns, index=prepared_fold['X_train'].index
+        )
+        X_fold_val = pd.DataFrame(
+            fold_scaler.transform(prepared_fold['X_val']),
+            columns=prepared_fold['X_val'].columns, index=prepared_fold['X_val'].index
+        )
+        y_fold_tr = prepared_fold['y_train']
+        y_fold_val = prepared_fold['y_val']
 
-        fold_model = ResMLP(n_features=X_tr_final.shape[1])
+        fold_model = ResMLP(n_features=X_fold_tr.shape[1])
         fold_model_trained, fold_y_mean, fold_y_std, _ = train_gpu_model(
             fold_model, f"ResMLP_Fold{fold + 1}", X_fold_tr, y_fold_tr,
             epochs=200, lr=8e-4, batch_size=512
@@ -1572,24 +1569,7 @@ print(f"   Bagging 完成 {train_time:.2f}s")
 
 # ===================== 新增：Bagging五折交叉验证 =====================
 print("   Bagging 五折CV...")
-bagging_cv_scores = {}
-for metric_name, metric in scoring_metrics.items():
-    scores = cross_val_score(bagging_model, X_tr_final, y_tr_final, cv=kf, scoring=metric, n_jobs=1)
-    if metric_name in ['MAE', 'RMSE']:
-        scores = -scores
-    bagging_cv_scores[metric_name] = scores
-
-cv_results['Bagging'] = {
-    'MAE': bagging_cv_scores['MAE'],
-    'RMSE': bagging_cv_scores['RMSE'],
-    'R2': bagging_cv_scores['R2'],
-    'Mean_MAE': np.mean(bagging_cv_scores['MAE']),
-    'Mean_RMSE': np.mean(bagging_cv_scores['RMSE']),
-    'Mean_R2': np.mean(bagging_cv_scores['R2']),
-    'Std_MAE': np.std(bagging_cv_scores['MAE']),
-    'Std_RMSE': np.std(bagging_cv_scores['RMSE']),
-    'Std_R2': np.std(bagging_cv_scores['R2'])
-}
+cv_results['Bagging'] = leakage_safe_cv(clone(bagging_model))
 
 print(f"   Bagging CV:")
 print(f"      MAE: {cv_results['Bagging']['Mean_MAE']:.4f} ± {cv_results['Bagging']['Std_MAE']:.4f}")
@@ -1620,24 +1600,7 @@ print(f"   Stacking 完成 {train_time:.2f}s")
 
 # ===================== 新增：Stacking五折交叉验证 =====================
 print("   Stacking 五折CV...")
-stacking_cv_scores = {}
-for metric_name, metric in scoring_metrics.items():
-    scores = cross_val_score(stacking_model, X_tr_final, y_tr_final, cv=kf, scoring=metric, n_jobs=1)
-    if metric_name in ['MAE', 'RMSE']:
-        scores = -scores
-    stacking_cv_scores[metric_name] = scores
-
-cv_results['Stacking'] = {
-    'MAE': stacking_cv_scores['MAE'],
-    'RMSE': stacking_cv_scores['RMSE'],
-    'R2': stacking_cv_scores['R2'],
-    'Mean_MAE': np.mean(stacking_cv_scores['MAE']),
-    'Mean_RMSE': np.mean(stacking_cv_scores['RMSE']),
-    'Mean_R2': np.mean(stacking_cv_scores['R2']),
-    'Std_MAE': np.std(stacking_cv_scores['MAE']),
-    'Std_RMSE': np.std(stacking_cv_scores['RMSE']),
-    'Std_R2': np.std(stacking_cv_scores['R2'])
-}
+cv_results['Stacking'] = leakage_safe_cv(clone(stacking_model))
 
 print(f"   Stacking CV:")
 print(f"      MAE: {cv_results['Stacking']['Mean_MAE']:.4f} ± {cv_results['Stacking']['Std_MAE']:.4f}")
@@ -1645,55 +1608,8 @@ print(f"      RMSE: {cv_results['Stacking']['Mean_RMSE']:.4f} ± {cv_results['St
 print(f"      R2: {cv_results['Stacking']['Mean_R2']:.4f} ± {cv_results['Stacking']['Std_R2']:.4f}")
 # ===================== 新增结束 =====================
 
-# ===================== 新增：每个模型的训练曲线统一为 R² 学习曲线（图+CSV） =====================
-print("\n" + "保存各模型训练曲线（R² 学习曲线）".center(80, "-"))
-models_use_scaled = {'SVR', 'Transformer', 'ResMLP'}
-n_features_lc = X_tr_final.shape[1]
-for model_name in list(trained_models.keys()):
-    try:
-        X_lc = X_tr_scaled if model_name in models_use_scaled else X_tr_final
-        y_lc = y_tr_final
-        if model_name == 'Transformer':
-            model_obj = TorchModelWrapper(TransformerRegressor, n_features_lc, epochs=40, lr=5e-4, batch_size=256, model_name="Transformer_LC")
-        elif model_name == 'ResMLP':
-            model_obj = TorchModelWrapper(ResMLP, n_features_lc, epochs=40, lr=8e-4, batch_size=256, model_name="ResMLP_LC")
-        else:
-            model_obj = trained_models[model_name]
-        train_sizes, train_scores, test_scores = learning_curve(
-            model_obj, X_lc, y_lc, cv=kf, scoring='r2', n_jobs=1,
-            train_sizes=np.linspace(0.1, 1.0, 10)
-        )
-        train_mean = np.mean(train_scores, axis=1)
-        train_std = np.std(train_scores, axis=1)
-        test_mean = np.mean(test_scores, axis=1)
-        test_std = np.std(test_scores, axis=1)
-        # sklearn.learning_curve 返回的 train_sizes 已经是“绝对样本数”（不是比例），不需要再乘以 len(y)
-        n_train = train_sizes.astype(int)
-        curve_df = pd.DataFrame({
-            'n_train_samples': n_train,
-            'train_r2_mean': train_mean,
-            'train_r2_std': train_std,
-            'test_r2_mean': test_mean,
-            'test_r2_std': test_std
-        })
-        curve_df.to_csv(os.path.join(TRAINING_CURVES_DIR, f"training_curve_{model_name}.csv"), index=False)
-        fig, ax = plt.subplots(figsize=(8, 5))
-        ax.fill_between(n_train, train_mean - train_std, train_mean + train_std, alpha=0.2)
-        ax.fill_between(n_train, test_mean - test_std, test_mean + test_std, alpha=0.2)
-        ax.plot(n_train, train_mean, 'b-o', label='Train R²', linewidth=1.5)
-        ax.plot(n_train, test_mean, 'g-s', label='CV Test R²', linewidth=1.5)
-        ax.set_xlabel('Training Set Size', fontsize=12)
-        ax.set_ylabel('R² Score', fontsize=12)
-        ax.set_title(f'{model_name} Learning Curve (R²)', fontsize=14, fontweight='bold')
-        ax.legend(loc='upper right', fontsize=8, framealpha=0.8)
-        ax.grid(alpha=0.3)
-        plt.tight_layout()
-        plt.savefig(os.path.join(TRAINING_CURVES_DIR, f"training_curve_{model_name}.png"), dpi=300, bbox_inches='tight')
-        plt.close()
-        print(f"   {model_name}: 学习曲线已保存")
-    except Exception as e:
-        print(f"   {model_name}: 训练曲线失败 {str(e)[:60]}")
-# ===================== 新增结束 =====================
+# 学习曲线若需保留，也必须逐训练规模重新拟合完整预处理链。
+# 为避免把全训练集预处理结果误作无泄漏学习曲线，本版本不再生成旧式学习曲线。
 
 # -------------------- 5. 模型评估（增强版） --------------------
 print("\n" + "模型性能评估".center(80, "-"))
@@ -1722,7 +1638,13 @@ for model_name in sorted_metrics.index:
     print(f"{model_name:<18} {mae:<8.4f} {rmse:<8.4f} {r2:<8.4f}")
 print("-" * 70)
 
-# 5.2 最佳模型标识
+# 5.2 最佳模型标识：按用户指定，以测试集R²最高者作为最优模型
+cv_model_ranking = pd.Series({
+    name: result['Mean_R2'] for name, result in cv_results.items()
+    if np.isfinite(result['Mean_R2']) and name in trained_models
+}).sort_values(ascending=False)
+if cv_model_ranking.empty:
+    raise RuntimeError("没有可用于模型选择的有效五折CV结果")
 best_model_name = sorted_metrics.index[0]
 best_model = trained_models.get(best_model_name, None)
 # 处理集成模型：Stacking取元模型
@@ -1736,16 +1658,19 @@ else:
 ensemble_models = ['Stacking', 'Bagging']
 # 筛选出单一模型（排除集成）中R²最高的，供SHAP回退使用
 single_models_r2 = {
-    model_name: sorted_metrics.loc[model_name, 'R2']
-    for model_name in sorted_metrics.index
-    if model_name not in ensemble_models and model_name in predictions
+    model_name: cv_results[model_name]['Mean_R2']
+    for model_name in cv_results
+    if model_name not in ensemble_models
+    and model_name in trained_models
+    and np.isfinite(cv_results[model_name]['Mean_R2'])
 }
 best_single_model_name = max(single_models_r2, key=single_models_r2.get) if single_models_r2 else None
 best_single_model = trained_models[best_single_model_name] if best_single_model_name else None
 best_single_r2 = single_models_r2.get(best_single_model_name, 0.0) if best_single_model_name else 0.0
 
 best_r2 = sorted_metrics.loc[best_model_name, 'R2']
-print(f"\n5.2 最佳模型: {best_model_display_name} | 最优R2: {best_r2:.4f}")
+best_cv_r2 = cv_results[best_model_name]['Mean_R2']
+print(f"\n5.2 测试集R2选定模型: {best_model_display_name} | 测试集R2: {best_r2:.4f} | CV R2: {best_cv_r2:.4f}")
 print(
     f"   - MAE: {sorted_metrics.loc[best_model_name, 'MAE']:.4f} (平均预测误差: {sorted_metrics.loc[best_model_name, 'MAE']:.2f} 分)")
 print(f"   - RMSE: {sorted_metrics.loc[best_model_name, 'RMSE']:.4f}")
@@ -1843,11 +1768,68 @@ print(f"   五折CV结果已保存: 5fold_cross_validation_results.xlsx")
 # ===================== 新增结束 =====================
 print(f"\n5.3 性能指标已保存: model_metrics_enhanced.csv")
 
+# -------------------- 5.5 保存真实的五折性能曲线 --------------------
+print("\n5.5 保存各模型五折性能曲线...")
+for curve_model_name, curve_data in cv_results.items():
+    folds = np.arange(1, len(curve_data['R2']) + 1)
+    curve_df = pd.DataFrame({
+        'Fold': folds,
+        'MAE': curve_data['MAE'],
+        'RMSE': curve_data['RMSE'],
+        'R2': curve_data['R2'],
+    })
+    curve_df.to_csv(
+        os.path.join(TRAINING_CURVES_DIR, f'training_curve_{curve_model_name}.csv'),
+        index=False
+    )
+    fig, axes = plt.subplots(1, 2, figsize=(10, 4))
+    axes[0].plot(folds, curve_data['R2'], marker='o', linewidth=1.8, color='#2E8B57')
+    axes[0].axhline(curve_data['Mean_R2'], linestyle='--', color='#C44E52',
+                    label=f"Mean = {curve_data['Mean_R2']:.4f}")
+    axes[0].set_xlabel('Cross-validation Fold')
+    axes[0].set_ylabel('R$^2$ Score')
+    axes[0].set_title(f'{curve_model_name} Five-fold R$^2$')
+    axes[0].set_xticks(folds)
+    axes[0].legend(fontsize=8)
+    axes[1].plot(folds, curve_data['MAE'], marker='o', label='MAE', color='#4C72B0')
+    axes[1].plot(folds, curve_data['RMSE'], marker='s', label='RMSE', color='#DD8452')
+    axes[1].set_xlabel('Cross-validation Fold')
+    axes[1].set_ylabel('Error')
+    axes[1].set_title(f'{curve_model_name} Five-fold Error')
+    axes[1].set_xticks(folds)
+    axes[1].legend(fontsize=8)
+    fig.tight_layout()
+    fig.savefig(
+        os.path.join(TRAINING_CURVES_DIR, f'training_curve_{curve_model_name}.png'),
+        dpi=300, bbox_inches='tight'
+    )
+    plt.close(fig)
+
+# 深度学习模型另外保存真实的epoch损失曲线。
+for loss_model_name, history in loss_histories.items():
+    valid_history = np.asarray(history, dtype=float)
+    if valid_history.size <= 1 or not np.isfinite(valid_history).any():
+        continue
+    fig, ax = plt.subplots(figsize=(7, 4))
+    ax.plot(np.arange(1, len(valid_history) + 1), valid_history, color='#4C72B0', linewidth=1.5)
+    ax.set_xlabel('Epoch')
+    ax.set_ylabel('Training Loss')
+    ax.set_title(f'{loss_model_name} Training Loss')
+    fig.tight_layout()
+    fig.savefig(
+        os.path.join(TRAINING_CURVES_DIR, f'training_loss_{loss_model_name}.png'),
+        dpi=300, bbox_inches='tight'
+    )
+    plt.close(fig)
+print(f"   训练曲线已保存: {TRAINING_CURVES_DIR}")
+
 # -------------------- 6. SHAP分析（仅对R2最好的模型；左summary右dependence同一张图） --------------------
 print("\n" + "SHAP 分析".center(80, "-"))
 # 确定SHAP分析用模型：R2最好的模型若支持SHAP则用其（Stacking 使用 KernelExplainer 可做SHAP）
 shap_model = None
 shap_model_name = None
+shap_importance_df = None
+top_20_feats = []
 if best_model_name in ensemble_models:
     if best_model_name == 'Stacking':
         shap_model = trained_models['Stacking']
@@ -1920,14 +1902,15 @@ if shap_model is not None:
         print(f"   SHAP 解释器失败: {e}")
 
     if shap_values is not None:
-        # 选择Top20特征
-        if len(X_sample.columns) >= TOP_FEATURES:
-            top_20_feats = pd.DataFrame({
-                'feature': X_sample.columns,
-                'shap_importance': np.abs(shap_values).mean(axis=0)
-            }).sort_values('shap_importance', ascending=False).head(TOP_FEATURES)['feature'].tolist()
-        else:
-            top_20_feats = X_sample.columns.tolist()
+        # 选择Top20特征，并保留供H-statistic及综合图复用。
+        shap_array = np.asarray(shap_values)
+        if shap_array.ndim == 3:
+            shap_array = shap_array[..., 0]
+        shap_importance_df = pd.DataFrame({
+            'feature': X_sample.columns,
+            'importance': np.abs(shap_array).mean(axis=0)
+        }).sort_values('importance', ascending=False)
+        top_20_feats = shap_importance_df.head(TOP_FEATURES)['feature'].tolist()
 
         # 6.2 单独保存一张 Top20 Summary 图（沿用最初版式）
         print("\n6.2 生成SHAP蜂群图（Top20特征）...")
@@ -1996,7 +1979,8 @@ if shap_model is not None:
             shap_model,
             X_tr_final,
             y_tr_final,
-            top_features=TOP_FEATURES
+            top_features=TOP_FEATURES,
+            feature_names=top_20_feats
         )
     # -------------------- 8. 特征重要性图（增强版：SHAP所用模型） --------------------
     print("\n" + "可视化图表生成".center(80, "-"))
@@ -2013,7 +1997,9 @@ if shap_model is not None:
 
         # 提取特征重要性
         imp_df = None
-        if hasattr(target_model, 'feature_importances_'):
+        if shap_importance_df is not None:
+            imp_df = shap_importance_df.head(TOP_FEATURES).copy()
+        elif hasattr(target_model, 'feature_importances_'):
             imp_df = pd.DataFrame({
                 'feature': X_tr_final.columns,
                 'importance': target_model.feature_importances_
@@ -2141,7 +2127,13 @@ if shap_model is not None:
         # 5. 特征重要性Top15图（最佳模型）
         ax5 = plt.subplot(3, 3, 5)
         # 替换：使用最佳单一模型而非集成模型
-        if shap_model is not None and hasattr(shap_model, 'feature_importances_'):
+        if shap_importance_df is not None:
+            imp_df = shap_importance_df.head(15)
+            ax5.barh(imp_df['feature'][::-1], imp_df['importance'][::-1], color='green')
+            ax5.set_xlabel('Mean Absolute SHAP Value', fontsize=10)
+            ax5.set_title('Top 15 SHAP Feature Importance', fontsize=12, fontweight='bold')
+            ax5.grid(axis='x', alpha=0.3)
+        elif shap_model is not None and hasattr(shap_model, 'feature_importances_'):
             imp_df = pd.DataFrame({
                 'feature': X_tr_final.columns,
                 'importance': shap_model.feature_importances_
@@ -2163,36 +2155,20 @@ if shap_model is not None:
             ax5.text(0.5, 0.5, 'No Valid Feature Importance Data', ha='center', va='center', fontsize=12)
             ax5.set_title('Top 15 Feature Importance Ranking (SHAP Model)', fontsize=12, fontweight='bold')
 
-        # 6. 训练收敛分析（Stacking）
+        # 6. 最优模型五折CV稳定性
         ax6 = plt.subplot(3, 3, 6)
-        # 为Stacking模型模拟训练曲线（基于CV过程的得分）
-        try:
-            # 提取Stacking模型CV过程的得分（如果有）
-            if hasattr(trained_models['Stacking'], 'final_estimator_'):
-                # 模拟Stacking训练曲线（使用基模型的平均得分）
-                base_models_scores = []
-                for name, model in trained_models['Stacking'].estimators_:
-                    if hasattr(model, 'oob_score_'):
-                        base_models_scores.append(model.oob_score_)
-                    elif hasattr(model, 'best_score_'):
-                        base_models_scores.append(model.best_score_)
-
-                # 生成模拟的训练迭代和损失
-                epochs = range(1, 101)
-                # 模拟损失递减曲线
-                train_loss = [1.0 / (x * 0.1 + 0.1) for x in epochs]
-                ax6.plot(epochs, train_loss, 'b-', label='Stacking Training Loss', linewidth=1.5)
-                ax6.set_xlabel('Training Iterations', fontsize=10)
-                ax6.set_ylabel('Loss Value', fontsize=10)
-                ax6.set_title('Stacking Training Convergence Analysis', fontsize=12, fontweight='bold')
-                ax6.legend(fontsize=9)
-                ax6.grid(alpha=0.3)
-            else:
-                raise Exception("No Stacking model found")
-        except Exception as e:
-            ax6.text(0.5, 0.5, 'Stacking Training Convergence\n(No Training Data)', ha='center', va='center',
-                     fontsize=12)
-            ax6.set_title('Stacking Training Convergence Analysis', fontsize=12, fontweight='bold')
+        selected_cv = cv_results[best_model_name]
+        fold_numbers = np.arange(1, len(selected_cv['R2']) + 1)
+        ax6.plot(fold_numbers, selected_cv['R2'], 'o-', color='#2E8B57', linewidth=2,
+                 label='Fold R$^2$')
+        ax6.axhline(selected_cv['Mean_R2'], color='#C44E52', linestyle='--', linewidth=1.5,
+                    label=f"Mean = {selected_cv['Mean_R2']:.4f}")
+        ax6.set_xticks(fold_numbers)
+        ax6.set_xlabel('Cross-validation Fold', fontsize=10)
+        ax6.set_ylabel('R$^2$ Score', fontsize=10)
+        ax6.set_title(f'{best_model_name} Five-fold CV Stability', fontsize=12, fontweight='bold')
+        ax6.legend(fontsize=9)
+        ax6.grid(alpha=0.3)
 
         # 7. 预测分布与真实分布对比图
         ax7 = plt.subplot(3, 3, 7)
@@ -2291,8 +2267,8 @@ if shap_model is not None:
             ==============================================
             - Raw Dataset: {len(df_raw)} samples, {df_raw.shape[1]} features
             - Cleaned Dataset: {len(df_clean)} samples, {X_raw.shape[1]} features
-            - Imputed Dataset: {len(X_imputed)} samples, {X_imputed.shape[1]} features
-            - After Feature Engineering: {X_enhanced.shape[1]} features
+            - Imputed Training Dataset: {len(X_tr_raw)} samples, {X_tr_raw.shape[1]} features
+            - After Feature Engineering: {X_tr_imputed.shape[1]} features
             - After Feature Selection: {len(top_features)} features
             - Training Set: {len(X_tr_final)} samples (80%)
             - Test Set: {len(X_te_final)} samples (20%)
@@ -2458,7 +2434,7 @@ if shap_model is not None:
     print(f"   6. Imputation Quality: {IMPUTATION_DIR}")
     print(f"   7. SHAP Analysis: {SHAP_DIR}")
     print(f"   8. H-statistic Interaction: {H_STAT_DIR}")
-    print(f"   9. Training Curves (per model): {TRAINING_CURVES_DIR}")
+    print(f"   9. Training Curves: {TRAINING_CURVES_DIR}")
     print(f"   10. 五折交叉验证结果: {cv_excel_path}")
 
     print(f"\nCore Results:")
